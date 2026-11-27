@@ -14,9 +14,18 @@ type Priority = "CRITICAL" | "HIGH" | "NORMAL";
 type MealType = "Breakfast" | "Lunch" | "Dinner";
 type MenuType = "regular" | "special";
 type DayType = "weekday" | "weekend" | "exam";
+type UserRole = "student" | "warden";
+
+interface AuthUser {
+  user_id: string;
+  role: UserRole;
+  name: string;
+  room: string;
+}
 
 interface Ticket {
   ticket_id: string;
+  student_id?: string;
   room: string;
   category: string;
   description: string;
@@ -24,6 +33,7 @@ interface Ticket {
   status: "OPEN" | "RESOLVED";
   created_at: string;
   resolved_at?: string;
+  resolved_by?: string;
 }
 
 interface OptOut {
@@ -88,7 +98,15 @@ function formatTime(iso?: string): string {
 }
 
 export default function CampusPulse() {
-  const [activeTab, setActiveTab] = useState<"student" | "warden">("student");
+  // Auth State
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [loginId, setLoginId] = useState("STU_204");
+  const [loginPassword, setLoginPassword] = useState("student123");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  // App State
   const [loading, setLoading] = useState(false);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
@@ -99,7 +117,6 @@ export default function CampusPulse() {
   const [tickets, setTickets] = useState<Ticket[]>([]);
 
   // Student Portal — Meal Opt-Out
-  const [studentId, setStudentId] = useState("STU_204");
   const [mealDate, setMealDate] = useState(() =>
     new Date().toISOString().split("T")[0]
   );
@@ -118,6 +135,24 @@ export default function CampusPulse() {
   >("ALL");
   const [searchQuery, setSearchQuery] = useState("");
 
+  // Restore session from localStorage
+  useEffect(() => {
+    try {
+      const savedUser = localStorage.getItem("campuspulse_user");
+      const savedToken = localStorage.getItem("campuspulse_token");
+      if (savedUser && savedToken) {
+        const parsed: AuthUser = JSON.parse(savedUser);
+        setAuthUser(parsed);
+        setAuthToken(savedToken);
+        if (parsed.role === "student" && parsed.room) {
+          setRoom(parsed.room);
+        }
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
+
   const fetchDashboard = async () => {
     try {
       const res = await fetch(`${API_BASE}/dashboard`, { cache: "no-store" });
@@ -133,12 +168,55 @@ export default function CampusPulse() {
   };
 
   useEffect(() => {
-    fetchDashboard();
-  }, []);
+    if (authUser) {
+      fetchDashboard();
+    }
+  }, [authUser]);
 
-  // Handlers
+  // Auth Handlers
+  const performLogin = async (userId: string, password: string) => {
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const res = await fetch(`${API_BASE}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId.trim(), password: password.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Invalid credentials");
+      }
+      setAuthUser(data.user);
+      setAuthToken(data.token);
+      if (data.user.role === "student" && data.user.room) {
+        setRoom(data.user.room);
+      }
+      localStorage.setItem("campuspulse_user", JSON.stringify(data.user));
+      localStorage.setItem("campuspulse_token", data.token);
+      setStatusMsg(null);
+      setErrorMsg(null);
+    } catch (err: unknown) {
+      setAuthError(
+        err instanceof Error ? err.message : "Login failed. Check POST /login."
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setAuthUser(null);
+    setAuthToken(null);
+    setStatusMsg(null);
+    setErrorMsg(null);
+    localStorage.removeItem("campuspulse_user");
+    localStorage.removeItem("campuspulse_token");
+  };
+
+  // Action Handlers
   const handleOptOut = async () => {
-    if (!studentId.trim()) return;
+    if (!authUser) return;
     setLoading(true);
     setStatusMsg(null);
     setErrorMsg(null);
@@ -147,14 +225,14 @@ export default function CampusPulse() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          student_id: studentId.trim(),
+          student_id: authUser.user_id,
           meal: selectedMeal,
           date: mealDate,
         }),
       });
       if (!res.ok) throw new Error("Failed to record opt-out");
       setStatusMsg(
-        `Opted out of ${selectedMeal} (${mealDate}) for ${studentId}. Mess count updated!`
+        `Opted out of ${selectedMeal} (${mealDate}) for ${authUser.user_id}. Mess count updated!`
       );
       await fetchDashboard();
     } catch {
@@ -165,6 +243,7 @@ export default function CampusPulse() {
   };
 
   const handleTicket = async () => {
+    if (!authUser) return;
     if (!description.trim()) {
       setErrorMsg("Please describe the hostel issue first.");
       return;
@@ -177,7 +256,8 @@ export default function CampusPulse() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          room: room.trim() || "Unknown",
+          student_id: authUser.user_id,
+          room: room.trim() || authUser.room || "Unknown",
           category,
           description: description.trim(),
         }),
@@ -200,20 +280,29 @@ export default function CampusPulse() {
   };
 
   const handleResolve = async (ticketId: string) => {
+    if (!authToken) return;
     setResolvingId(ticketId);
     setStatusMsg(null);
     setErrorMsg(null);
     try {
       const res = await fetch(`${API_BASE}/resolve`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({ ticket_id: ticketId }),
       });
-      if (!res.ok) throw new Error("Failed to resolve ticket");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to resolve ticket");
       setStatusMsg(`Ticket ${ticketId} marked as RESOLVED in DynamoDB.`);
       await fetchDashboard();
-    } catch {
-      setErrorMsg("Could not resolve ticket. Check POST /resolve in API Gateway.");
+    } catch (err: unknown) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : "Could not resolve ticket. Check Warden auth."
+      );
     } finally {
       setResolvingId(null);
     }
@@ -221,13 +310,29 @@ export default function CampusPulse() {
 
   // Derived Metrics
   const liveOptOutsCount = optouts.length;
-  const studentOptOutsCount = optouts.filter(
-    (o) => o.student_id.toLowerCase() === studentId.trim().toLowerCase()
-  ).length;
   const openCriticalCount = tickets.filter(
     (t) => t.priority === "CRITICAL" && t.status !== "RESOLVED"
   ).length;
   const resolvedCount = tickets.filter((t) => t.status === "RESOLVED").length;
+
+  // Student-Specific Data
+  const myOptOuts = useMemo(() => {
+    if (!authUser) return [];
+    return optouts
+      .filter(
+        (o) => o.student_id.toUpperCase() === authUser.user_id.toUpperCase()
+      )
+      .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  }, [optouts, authUser]);
+
+  const myTickets = useMemo(() => {
+    if (!authUser) return [];
+    return tickets.filter(
+      (t) =>
+        (t.student_id || "").toUpperCase() === authUser.user_id.toUpperCase() ||
+        t.room.toUpperCase() === authUser.room.toUpperCase()
+    );
+  }, [tickets, authUser]);
 
   // Mess Demand Forecast
   const forecast = useMemo(() => {
@@ -278,7 +383,7 @@ export default function CampusPulse() {
     URL.revokeObjectURL(url);
   };
 
-  // 7-Day Food Waste Savings Trend (last 6 days baseline + live Today)
+  // 7-Day Food Waste Savings Trend
   const weeklyTrend = useMemo(() => {
     const days = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Today"];
     const counts = [34, 52, 29, 36, 41, 33, liveOptOutsCount];
@@ -297,7 +402,7 @@ export default function CampusPulse() {
   const weeklyTotalInr = weeklyTrend.reduce((sum, d) => sum + d.inr, 0);
   const maxWeeklyKg = Math.max(...weeklyTrend.map((d) => d.kg), 1);
 
-  // Filtered Tickets
+  // Filtered Tickets (Warden)
   const filteredTickets = useMemo(() => {
     return tickets.filter((t) => {
       if (priorityFilter === "RESOLVED" && t.status !== "RESOLVED") return false;
@@ -322,6 +427,117 @@ export default function CampusPulse() {
   }, [tickets, priorityFilter, searchQuery]);
 
   const livePreview = previewPriority(description, category);
+
+  // LOGIN SCREEN
+  if (!authUser) {
+    return (
+      <div className="min-h-screen bg-[#060b14] text-slate-100 flex items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-[#0b1322] p-7 space-y-6 shadow-2xl">
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 rounded-xl bg-emerald-500/20 border border-emerald-400/40 flex items-center justify-center text-emerald-400">
+              <svg
+                className="w-6 h-6"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2.2}
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M3 12h4l3-7 4 14 3-7h4"
+                />
+              </svg>
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-white">CampusPulse</h1>
+              <p className="text-xs text-slate-400">
+                Role-Based Hostel Portal • AWS Serverless
+              </p>
+            </div>
+          </div>
+
+          {authError && (
+            <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-300">
+              {authError}
+            </div>
+          )}
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              performLogin(loginId, loginPassword);
+            }}
+            className="space-y-4"
+          >
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Student ID or Warden ID
+              </label>
+              <input
+                value={loginId}
+                onChange={(e) => setLoginId(e.target.value)}
+                placeholder="e.g., STU_204 or WARDEN_01"
+                className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Password
+              </label>
+              <input
+                type="password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={authLoading}
+              className="w-full rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold py-3 text-sm transition cursor-pointer"
+            >
+              {authLoading ? "Signing in via AWS Lambda..." : "Sign In"}
+            </button>
+          </form>
+
+          {/* 1-Click Judge Demo Logins */}
+          <div className="border-t border-slate-800 pt-4 space-y-2.5">
+            <p className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold text-center">
+              1-Click Demo Access (For Judges)
+            </p>
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                disabled={authLoading}
+                onClick={() => performLogin("STU_204", "student123")}
+                className="rounded-xl border border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 px-3 py-2.5 text-xs font-semibold text-cyan-300 transition cursor-pointer"
+              >
+                🎓 Demo Student
+                <span className="block text-[10px] text-slate-400 font-normal mt-0.5">
+                  STU_204 • Room B-204
+                </span>
+              </button>
+              <button
+                type="button"
+                disabled={authLoading}
+                onClick={() => performLogin("WARDEN_01", "warden123")}
+                className="rounded-xl border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-2.5 text-xs font-semibold text-amber-300 transition cursor-pointer"
+              >
+                🛡️ Demo Warden
+                <span className="block text-[10px] text-slate-400 font-normal mt-0.5">
+                  WARDEN_01 • Admin
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#060b14] text-slate-100 font-sans selection:bg-emerald-500/30">
@@ -349,38 +565,37 @@ export default function CampusPulse() {
                 CampusPulse
               </h1>
               <p className="text-xs text-slate-400">
-                Hostel mess and maintenance triage
+                {authUser.role === "warden"
+                  ? "Warden Operations Console"
+                  : "Student Hostel Portal"}
               </p>
             </div>
           </div>
 
-          {/* Portal Switcher */}
-          <div className="flex items-center bg-slate-900/90 p-1 rounded-xl border border-slate-800">
-            <button
-              onClick={() => setActiveTab("student")}
-              className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition cursor-pointer ${
-                activeTab === "student"
-                  ? "bg-emerald-500 text-slate-950 shadow"
-                  : "text-slate-300 hover:text-white"
-              }`}
-            >
-              Student Portal
-            </button>
-            <button
-              onClick={() => setActiveTab("warden")}
-              className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition cursor-pointer ${
-                activeTab === "warden"
-                  ? "bg-emerald-500 text-slate-950 shadow"
-                  : "text-slate-300 hover:text-white"
-              }`}
-            >
-              Warden Dashboard
-            </button>
-          </div>
+          {/* Logged-in User Badge + Logout */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-800 bg-slate-900/90 text-xs">
+              <span
+                className={`px-2 py-0.5 rounded font-bold uppercase text-[10px] ${
+                  authUser.role === "warden"
+                    ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                    : "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
+                }`}
+              >
+                {authUser.role}
+              </span>
+              <span className="text-white font-semibold">{authUser.name}</span>
+              <span className="text-slate-500 hidden sm:inline">
+                ({authUser.user_id} • {authUser.room})
+              </span>
+            </div>
 
-          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 text-xs font-medium">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            AWS Connected • Lambda + DynamoDB + SNS
+            <button
+              onClick={handleLogout}
+              className="px-3 py-1.5 rounded-xl border border-slate-700 bg-slate-900 hover:bg-slate-800 text-xs font-semibold text-slate-300 hover:text-white cursor-pointer"
+            >
+              Sign Out
+            </button>
           </div>
         </div>
       </header>
@@ -466,234 +681,319 @@ export default function CampusPulse() {
         </section>
 
         {/* STUDENT PORTAL */}
-        {activeTab === "student" ? (
-          <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* 1-Tap Meal Opt-Out */}
-            <div className="rounded-2xl border border-slate-800/90 bg-[#0b1322] p-6 flex flex-col justify-between space-y-5">
-              <div className="space-y-4">
+        {authUser.role === "student" ? (
+          <div className="space-y-6">
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* 1-Tap Meal Opt-Out */}
+              <div className="rounded-2xl border border-slate-800/90 bg-[#0b1322] p-6 flex flex-col justify-between space-y-5">
+                <div className="space-y-4">
+                  <div>
+                    <h2 className="text-lg font-bold text-white">
+                      1-Tap Meal Opt-Out
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Skipping a meal? Tell the mess so food is not cooked for
+                      nobody.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Student ID
+                      </label>
+                      <input
+                        value={authUser.user_id}
+                        disabled
+                        className="w-full rounded-xl bg-slate-950/60 border border-slate-800 px-3 py-2 text-sm text-slate-400 cursor-not-allowed"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Date
+                      </label>
+                      <input
+                        type="date"
+                        value={mealDate}
+                        onChange={(e) => setMealDate(e.target.value)}
+                        className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-3">
+                    {(
+                      [
+                        { name: "Breakfast", time: "7:30 – 9:00", icon: "🍳" },
+                        { name: "Lunch", time: "12:30 – 2:00", icon: "🍛" },
+                        { name: "Dinner", time: "7:30 – 9:00", icon: "🌙" },
+                      ] as const
+                    ).map((m) => (
+                      <button
+                        key={m.name}
+                        type="button"
+                        onClick={() => setSelectedMeal(m.name)}
+                        className={`rounded-xl border p-3 text-center transition cursor-pointer ${
+                          selectedMeal === m.name
+                            ? "border-emerald-500 bg-emerald-500/15 text-white"
+                            : "border-slate-800 bg-slate-950/60 text-slate-400 hover:border-slate-700"
+                        }`}
+                      >
+                        <div className="text-xl mb-1">{m.icon}</div>
+                        <div className="text-sm font-semibold">{m.name}</div>
+                        <div className="text-[11px] text-slate-500">
+                          {m.time}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+
+                  <button
+                    onClick={handleOptOut}
+                    disabled={loading}
+                    className="w-full rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold py-3 text-sm transition cursor-pointer"
+                  >
+                    {loading ? "Updating AWS..." : "Skip This Meal"}
+                  </button>
+                </div>
+
+                {/* Personal Savings Progress */}
+                <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                  <div className="flex items-center justify-between text-xs mb-2">
+                    <span className="text-slate-300">
+                      You have helped save{" "}
+                      <strong className="text-emerald-400">
+                        {(myOptOuts.length * KG_PER_PLATE).toFixed(1)} kg
+                      </strong>{" "}
+                      of food
+                    </span>
+                    <span className="text-slate-500">
+                      {myOptOuts.length}/20 meals
+                    </span>
+                  </div>
+                  <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-500 transition-all"
+                      style={{
+                        width: `${Math.min(100, (myOptOuts.length / 20) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Report Hostel Issue */}
+              <div className="rounded-2xl border border-slate-800/90 bg-[#0b1322] p-6 space-y-4">
                 <div>
                   <h2 className="text-lg font-bold text-white">
-                    1-Tap Meal Opt-Out
+                    Report Hostel Issue
                   </h2>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Skipping a meal? Tell the mess so food is not cooked for
-                    nobody.
+                    Urgent keywords such as &quot;spark&quot;, &quot;no
+                    water&quot; or &quot;short circuit&quot; email the Warden
+                    instantly through SNS.
                   </p>
+                </div>
+
+                {/* Demo Presets */}
+                <div className="space-y-1.5">
+                  <p className="text-xs text-slate-500">Demo presets</p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRoom(authUser.room);
+                        setCategory("Electrical");
+                        setDescription(
+                          "Switchboard spark and burning smell near study desk — urgent!"
+                        );
+                      }}
+                      className="px-3 py-1.5 rounded-full text-xs font-medium border border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 cursor-pointer"
+                    >
+                      ⚡ Electrical Spark (Critical)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRoom(authUser.room);
+                        setCategory("Plumbing");
+                        setDescription(
+                          "Water pipe leak in washroom corridor flooding the floor."
+                        );
+                      }}
+                      className="px-3 py-1.5 rounded-full text-xs font-medium border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 cursor-pointer"
+                    >
+                      💧 Water Pipe Leak (High)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRoom(authUser.room);
+                        setCategory("Furniture");
+                        setDescription(
+                          "Study chair leg is loose and needs repair."
+                        );
+                      }}
+                      className="px-3 py-1.5 rounded-full text-xs font-medium border border-slate-700 bg-slate-800/60 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                    >
+                      🪑 Chair Repair (Normal)
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs text-slate-400 mb-1">
-                      Student ID
+                      Room
                     </label>
                     <input
-                      value={studentId}
-                      onChange={(e) => setStudentId(e.target.value)}
-                      className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                      value={room}
+                      onChange={(e) => setRoom(e.target.value)}
+                      className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500"
                     />
                   </div>
                   <div>
                     <label className="block text-xs text-slate-400 mb-1">
-                      Date
+                      Category
                     </label>
-                    <input
-                      type="date"
-                      value={mealDate}
-                      onChange={(e) => setMealDate(e.target.value)}
-                      className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
-                    />
+                    <select
+                      value={category}
+                      onChange={(e) => setCategory(e.target.value)}
+                      className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500"
+                    >
+                      <option>Electrical</option>
+                      <option>Plumbing</option>
+                      <option>Wi-Fi</option>
+                      <option>Furniture</option>
+                      <option>General</option>
+                    </select>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-3 gap-3">
-                  {(
-                    [
-                      { name: "Breakfast", time: "7:30 – 9:00", icon: "🍳" },
-                      { name: "Lunch", time: "12:30 – 2:00", icon: "🍛" },
-                      { name: "Dinner", time: "7:30 – 9:00", icon: "🌙" },
-                    ] as const
-                  ).map((m) => (
-                    <button
-                      key={m.name}
-                      type="button"
-                      onClick={() => setSelectedMeal(m.name)}
-                      className={`rounded-xl border p-3 text-center transition cursor-pointer ${
-                        selectedMeal === m.name
-                          ? "border-emerald-500 bg-emerald-500/15 text-white"
-                          : "border-slate-800 bg-slate-950/60 text-slate-400 hover:border-slate-700"
-                      }`}
-                    >
-                      <div className="text-xl mb-1">{m.icon}</div>
-                      <div className="text-sm font-semibold">{m.name}</div>
-                      <div className="text-[11px] text-slate-500">{m.time}</div>
-                    </button>
-                  ))}
+                <textarea
+                  rows={3}
+                  placeholder="Describe the issue..."
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  className="w-full rounded-xl bg-slate-950 border border-slate-800 p-3 text-sm text-white focus:outline-none focus:border-amber-500"
+                />
+
+                {/* Live Priority Preview */}
+                <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-3.5 py-2.5 flex items-center gap-2.5 text-xs">
+                  <span className="text-slate-400">Priority preview</span>
+                  <span
+                    className={`px-2 py-0.5 rounded font-bold ${
+                      livePreview === "CRITICAL"
+                        ? "bg-rose-500/20 text-rose-400 border border-rose-500/40"
+                        : livePreview === "HIGH"
+                        ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                        : "bg-slate-800 text-slate-300"
+                    }`}
+                  >
+                    {livePreview}
+                  </span>
+                  <span className="text-slate-500 truncate">
+                    {description.trim()
+                      ? livePreview === "CRITICAL"
+                        ? "Will trigger instant Warden SNS email."
+                        : "Will be queued in Warden Dashboard."
+                      : "Start typing to see how this will be triaged."}
+                  </span>
                 </div>
 
                 <button
-                  onClick={handleOptOut}
+                  onClick={handleTicket}
                   disabled={loading}
-                  className="w-full rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold py-3 text-sm transition cursor-pointer"
+                  className="w-full rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold py-3 text-sm transition cursor-pointer"
                 >
-                  {loading ? "Updating AWS..." : "Skip This Meal"}
+                  {loading ? "Triaging on AWS..." : "Submit & Auto-Triage"}
                 </button>
               </div>
+            </section>
 
-              {/* Personal Savings Progress */}
-              <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-                <div className="flex items-center justify-between text-xs mb-2">
-                  <span className="text-slate-300">
-                    You have helped save{" "}
-                    <strong className="text-emerald-400">
-                      {(studentOptOutsCount * KG_PER_PLATE).toFixed(1)} kg
-                    </strong>{" "}
-                    of food
-                  </span>
-                  <span className="text-slate-500">
-                    {studentOptOutsCount}/20 meals
-                  </span>
+            {/* Student Personal Trackers: My Reported Tickets + My Opt-Out History */}
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* My Reported Tickets */}
+              <div className="rounded-2xl border border-slate-800/90 bg-[#0b1322] p-6 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-base font-bold text-white">
+                    My Reported Tickets ({myTickets.length})
+                  </h2>
+                  <button
+                    onClick={fetchDashboard}
+                    className="text-xs text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    ↻ Refresh
+                  </button>
                 </div>
-                <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-                  <div
-                    className="h-full bg-emerald-500 transition-all"
-                    style={{
-                      width: `${Math.min(100, (studentOptOutsCount / 20) * 100)}%`,
-                    }}
-                  />
-                </div>
-                <p className="text-[11px] text-slate-500 mt-2">
-                  {Math.max(0, 20 - studentOptOutsCount)} more skipped meals to
-                  reach your monthly sustainability goal.
-                </p>
+                {myTickets.length === 0 ? (
+                  <p className="text-xs text-slate-500">
+                    No tickets reported for Room {authUser.room} yet.
+                  </p>
+                ) : (
+                  <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
+                    {myTickets.map((t) => (
+                      <div
+                        key={t.ticket_id}
+                        className="rounded-xl border border-slate-800 bg-slate-950/70 p-3 flex items-center justify-between gap-3"
+                      >
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className="font-semibold text-white">
+                              {t.category} • Room {t.room}
+                            </span>
+                            <span className="text-slate-500">
+                              ({t.ticket_id})
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-400">
+                            {t.description}
+                          </p>
+                        </div>
+                        <span
+                          className={`shrink-0 px-2.5 py-1 rounded-md text-[11px] font-semibold ${
+                            t.status === "RESOLVED"
+                              ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                              : "bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                          }`}
+                        >
+                          {t.status === "RESOLVED" ? "✓ Resolved" : "Open"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
 
-            {/* Report Hostel Issue */}
-            <div className="rounded-2xl border border-slate-800/90 bg-[#0b1322] p-6 space-y-4">
-              <div>
-                <h2 className="text-lg font-bold text-white">
-                  Report Hostel Issue
+              {/* My Opt-Out History */}
+              <div className="rounded-2xl border border-slate-800/90 bg-[#0b1322] p-6 space-y-4">
+                <h2 className="text-base font-bold text-white">
+                  My Meal Opt-Out History ({myOptOuts.length})
                 </h2>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Urgent keywords such as &quot;spark&quot;, &quot;no
-                  water&quot; or &quot;short circuit&quot; email the Warden
-                  instantly through SNS.
-                </p>
+                {myOptOuts.length === 0 ? (
+                  <p className="text-xs text-slate-500">
+                    You haven&apos;t skipped any meals yet.
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                    {myOptOuts.map((o) => (
+                      <div
+                        key={o.optout_id}
+                        className="rounded-xl border border-slate-800 bg-slate-950/70 px-3.5 py-2.5 flex items-center justify-between text-xs"
+                      >
+                        <span className="text-white font-medium">
+                          {o.meal} • {o.date}
+                        </span>
+                        <span className="text-emerald-400 font-semibold">
+                          Saved {KG_PER_PLATE} kg
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-
-              {/* Demo Presets */}
-              <div className="space-y-1.5">
-                <p className="text-xs text-slate-500">Demo presets</p>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setRoom("B-204");
-                      setCategory("Electrical");
-                      setDescription(
-                        "Switchboard spark and burning smell near study desk — urgent!"
-                      );
-                    }}
-                    className="px-3 py-1.5 rounded-full text-xs font-medium border border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 cursor-pointer"
-                  >
-                    ⚡ Electrical Spark (Critical)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setRoom("A-112");
-                      setCategory("Plumbing");
-                      setDescription(
-                        "Water pipe leak in washroom corridor flooding the floor."
-                      );
-                    }}
-                    className="px-3 py-1.5 rounded-full text-xs font-medium border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 cursor-pointer"
-                  >
-                    💧 Water Pipe Leak (High)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setRoom("C-305");
-                      setCategory("Furniture");
-                      setDescription("Study chair leg is loose and needs repair.");
-                    }}
-                    className="px-3 py-1.5 rounded-full text-xs font-medium border border-slate-700 bg-slate-800/60 text-slate-300 hover:bg-slate-800 cursor-pointer"
-                  >
-                    🪑 Chair Repair (Normal)
-                  </button>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs text-slate-400 mb-1">
-                    Room
-                  </label>
-                  <input
-                    value={room}
-                    onChange={(e) => setRoom(e.target.value)}
-                    className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-slate-400 mb-1">
-                    Category
-                  </label>
-                  <select
-                    value={category}
-                    onChange={(e) => setCategory(e.target.value)}
-                    className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500"
-                  >
-                    <option>Electrical</option>
-                    <option>Plumbing</option>
-                    <option>Wi-Fi</option>
-                    <option>Furniture</option>
-                    <option>General</option>
-                  </select>
-                </div>
-              </div>
-
-              <textarea
-                rows={3}
-                placeholder="Describe the issue..."
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                className="w-full rounded-xl bg-slate-950 border border-slate-800 p-3 text-sm text-white focus:outline-none focus:border-amber-500"
-              />
-
-              {/* Live Priority Preview */}
-              <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-3.5 py-2.5 flex items-center gap-2.5 text-xs">
-                <span className="text-slate-400">Priority preview</span>
-                <span
-                  className={`px-2 py-0.5 rounded font-bold ${
-                    livePreview === "CRITICAL"
-                      ? "bg-rose-500/20 text-rose-400 border border-rose-500/40"
-                      : livePreview === "HIGH"
-                      ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
-                      : "bg-slate-800 text-slate-300"
-                  }`}
-                >
-                  {livePreview}
-                </span>
-                <span className="text-slate-500 truncate">
-                  {description.trim()
-                    ? livePreview === "CRITICAL"
-                      ? "Will trigger instant Warden SNS email."
-                      : "Will be queued in Warden Dashboard."
-                    : "Start typing to see how this will be triaged."}
-                </span>
-              </div>
-
-              <button
-                onClick={handleTicket}
-                disabled={loading}
-                className="w-full rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold py-3 text-sm transition cursor-pointer"
-              >
-                {loading ? "Triaging on AWS..." : "Submit & Auto-Triage"}
-              </button>
-            </div>
-          </section>
+            </section>
+          </div>
         ) : (
           /* WARDEN DASHBOARD */
           <div className="space-y-6">
@@ -710,7 +1010,6 @@ export default function CampusPulse() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  {/* Menu Toggle */}
                   <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
                     <button
                       onClick={() => setMenuType("regular")}
@@ -734,7 +1033,6 @@ export default function CampusPulse() {
                     </button>
                   </div>
 
-                  {/* Day Toggle */}
                   <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
                     {(["weekday", "weekend", "exam"] as const).map((d) => (
                       <button
@@ -751,7 +1049,6 @@ export default function CampusPulse() {
                     ))}
                   </div>
 
-                  {/* Export CSV Button */}
                   <button
                     onClick={handleDownloadPrepSheet}
                     className="px-3 py-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs font-semibold cursor-pointer"
@@ -762,7 +1059,6 @@ export default function CampusPulse() {
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-center">
-                {/* Bars */}
                 <div className="space-y-4">
                   <div>
                     <div className="flex justify-between text-xs mb-1">
@@ -820,7 +1116,6 @@ export default function CampusPulse() {
                   </p>
                 </div>
 
-                {/* 4 Metric Boxes */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
                     <p className="text-xs text-slate-400">Predicted Plates</p>
@@ -889,7 +1184,6 @@ export default function CampusPulse() {
                   role="img"
                   aria-label="7-Day Food Waste Saved Bar Chart"
                 >
-                  {/* Horizontal Grid Lines */}
                   {[40, 90, 140].map((y) => (
                     <line
                       key={y}
@@ -974,7 +1268,6 @@ export default function CampusPulse() {
                 </button>
               </div>
 
-              {/* Filter Pills + Search */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap gap-2">
                   {(
@@ -1012,7 +1305,6 @@ export default function CampusPulse() {
                 />
               </div>
 
-              {/* Ticket Cards */}
               {filteredTickets.length === 0 ? (
                 <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-8 text-center text-sm text-slate-500">
                   No tickets match this filter.
@@ -1086,7 +1378,7 @@ export default function CampusPulse() {
         {/* Architecture Footer */}
         <footer className="rounded-2xl border border-slate-800/80 bg-[#080f1d] p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex flex-wrap items-center gap-2">
-            {["AWS Amplify / S3", "API Gateway", "Lambda (Python)"].map(
+            {["AWS Amplify / S3", "API Gateway", "Lambda (Python + RBAC)"].map(
               (svc) => (
                 <span key={svc} className="flex items-center gap-2">
                   <span className="rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1 text-slate-200 font-medium">
